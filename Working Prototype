@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+VoIP Call Tracer - Advanced SIP and RTP Analysis Tool
+For Law Enforcement and Security Monitoring
+"""
+
+import scapy.all as scapy
+import dpkt
+import re
+import json
+import time
+import threading
+import sqlite3
+from datetime import datetime, timedelta
+from collections import defaultdict, deque
+import argparse
+import logging
+from typing import Dict, List, Optional, Tuple
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('voip_tracer.log'),
+        logging.StreamHandler()
+    ]
+)
+
+class VoIPTracer:
+    def __init__(self, interface: str = None, pcap_file: str = None):
+        self.interface = interface
+        self.pcap_file = pcap_file
+        self.active_calls = {}
+        self.suspicious_calls = []
+        self.call_history = deque(maxlen=1000)
+        self.threat_intel = self.load_threat_intel()
+        self.running = False
+        
+        # Database setup
+        self.db_conn = sqlite3.connect('voip_calls.db', check_same_thread=False)
+        self.init_database()
+        
+        # Pattern matching
+        self.sip_patterns = {
+            'call_id': re.compile(r'Call-ID:\s*([^\r\n]+)', re.IGNORECASE),
+            'from': re.compile(r'From:\s*[^<]*<sip:([^@>]+@[^>]+)>', re.IGNORECASE),
+            'to': re.compile(r'To:\s*[^<]*<sip:([^@>]+@[^>]+)>', re.IGNORECASE),
+            'user_agent': re.compile(r'User-Agent:\s*([^\r\n]+)', re.IGNORECASE),
+            'contact': re.compile(r'Contact:\s*[^<]*<sip:([^>]+)>', re.IGNORECASE)
+        }
+
+    def load_threat_intel(self) -> Dict:
+        """Load threat intelligence data"""
+        try:
+            with open('threat_intel.json', 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {
+                "malicious_ips": [],
+                "suspicious_user_agents": [],
+                "high_risk_regions": [],
+                "known_attack_patterns": []
+            }
+
+    def init_database(self):
+        """Initialize SQLite database"""
+        cursor = self.db_conn.cursor()
+        
+        # Create calls table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_id TEXT UNIQUE,
+                caller TEXT,
+                callee TEXT,
+                caller_ip TEXT,
+                callee_ip TEXT,
+                user_agent TEXT,
+                start_time DATETIME,
+                end_time DATETIME,
+                duration REAL,
+                suspicious BOOLEAN DEFAULT 0,
+                risk_score INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Create alerts table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_id TEXT,
+                alert_type TEXT,
+                severity TEXT,
+                description TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                acknowledged BOOLEAN DEFAULT 0
+            )
+        ''')
+        
+        self.db_conn.commit()
+
+    def parse_sip_packet(self, packet: bytes) -> Optional[Dict]:
+        """Parse SIP packet and extract metadata"""
+        try:
+            payload = packet.decode('utf-8', errors='ignore')
+            
+            if not any(method in payload for method in ['INVITE', 'BYE', 'CANCEL', 'ACK', '200 OK']):
+                return None
+            
+            metadata = {}
+            for key, pattern in self.sip_patterns.items():
+                match = pattern.search(payload)
+                if match:
+                    metadata[key] = match.group(1).strip()
+            
+            # Extract SIP method
+            if payload.startswith('INVITE'):
+                metadata['method'] = 'INVITE'
+            elif payload.startswith('BYE'):
+                metadata['method'] = 'BYE'
+            elif payload.startswith('CANCEL'):
+                metadata['method'] = 'CANCEL'
+            elif '200 OK' in payload:
+                metadata['method'] = '200 OK'
+            
+            return metadata if metadata else None
+            
+        except Exception as e:
+            logging.error(f"Error parsing SIP packet: {e}")
+            return None
+
+    def analyze_call_risk(self, call_metadata: Dict) -> int:
+        """Analyze call risk based on various factors"""
+        risk_score = 0
+        
+        # Check suspicious user agents
+        ua = call_metadata.get('user_agent', '').lower()
+        if any(suspicious in ua for suspicious in self.threat_intel['suspicious_user_agents']):
+            risk_score += 30
+        
+        # Check short duration (potential scanning)
+        duration = call_metadata.get('duration', 0)
+        if duration and duration < 3:  # Less than 3 seconds
+            risk_score += 20
+        
+        # High frequency calls from same source (implement later)
+        
+        return min(risk_score, 100)
+
+    def process_packet(self, packet):
+        """Process network packet"""
+        try:
+            if packet.haslayer(scapy.IP) and packet.haslayer(scapy.UDP):
+                ip_src = packet[scapy.IP].src
+                ip_dst = packet[scapy.IP].dst
+                payload = bytes(packet[scapy.UDP].payload)
+                
+                # Check for SIP traffic (port 5060)
+                if packet[scapy.UDP].dport == 5060 or packet[scapy.UDP].sport == 5060:
+                    metadata = self.parse_sip_packet(payload)
+                    if metadata:
+                        self.handle_sip_traffic(metadata, ip_src, ip_dst)
+                
+                # Check for RTP traffic (dynamic ports, usually even numbers 10000-20000)
+                elif 10000 <= packet[scapy.UDP].dport <= 20000 and packet[scapy.UDP].dport % 2 == 0:
+                    self.handle_rtp_traffic(ip_src, ip_dst, packet.time)
+                
+        except Exception as e:
+            logging.error(f"Error processing packet: {e}")
+
+    def handle_sip_traffic(self, metadata: Dict, src_ip: str, dst_ip: str):
+        """Handle SIP signaling traffic"""
+        call_id = metadata.get('call_id')
+        method = metadata.get('method')
+        
+        if not call_id:
+            return
+        
+        timestamp = datetime.now()
+        
+        if method == 'INVITE':
+            # New call
+            self.active_calls[call_id] = {
+                'caller': metadata.get('from'),
+                'callee': metadata.get('to'),
+                'caller_ip': src_ip,
+                'callee_ip': dst_ip,
+                'user_agent': metadata.get('user_agent'),
+                'start_time': timestamp,
+                'end_time': None,
+                'rtp_packets': 0,
+                'last_rtp_time': None
+            }
+            logging.info(f"New call started: {metadata.get('from')} -> {metadata.get('to')}")
+            
+        elif method in ['BYE', 'CANCEL'] and call_id in self.active_calls:
+            # Call ended
+            call = self.active_calls[call_id]
+            call['end_time'] = timestamp
+            duration = (timestamp - call['start_time']).total_seconds()
+            call['duration'] = duration
+            
+            # Analyze risk
+            risk_score = self.analyze_call_risk(call)
+            call['risk_score'] = risk_score
+            call['suspicious'] = risk_score >= 50
+            
+            # Store in database
+            self.store_call(call)
+            
+            # Add to history
+            self.call_history.append(call)
+            
+            if call['suspicious']:
+                self.suspicious_calls.append(call)
+                self.create_alert(call_id, "SUSPICIOUS_CALL", 
+                                 "HIGH" if risk_score >= 70 else "MEDIUM",
+                                 f"Suspicious call detected with risk score {risk_score}")
+            
+            del self.active_calls[call_id]
+            logging.info(f"Call ended: Duration {duration:.2f}s, Risk: {risk_score}")
+
+    def handle_rtp_traffic(self, src_ip: str, dst_ip: str, timestamp: float):
+        """Handle RTP media traffic"""
+        for call_id, call in self.active_calls.items():
+            if src_ip in [call['caller_ip'], call['callee_ip']] and \
+               dst_ip in [call['caller_ip'], call['callee_ip']]:
+                call['rtp_packets'] += 1
+                call['last_rtp_time'] = datetime.fromtimestamp(timestamp)
+                break
+
+    def store_call(self, call: Dict):
+        """Store call metadata in database"""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO calls 
+                (call_id, caller, callee, caller_ip, callee_ip, user_agent, 
+                 start_time, end_time, duration, suspicious, risk_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                call.get('call_id'),
+                call.get('caller'),
+                call.get('callee'),
+                call.get('caller_ip'),
+                call.get('callee_ip'),
+                call.get('user_agent'),
+                call.get('start_time'),
+                call.get('end_time'),
+                call.get('duration'),
+                call.get('suspicious', False),
+                call.get('risk_score', 0)
+            ))
+            self.db_conn.commit()
+        except Exception as e:
+            logging.error(f"Error storing call: {e}")
+
+    def create_alert(self, call_id: str, alert_type: str, severity: str, description: str):
+        """Create alert in database"""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute('''
+                INSERT INTO alerts (call_id, alert_type, severity, description)
+                VALUES (?, ?, ?, ?)
+            ''', (call_id, alert_type, severity, description))
+            self.db_conn.commit()
+            logging.warning(f"ALERT: {severity} - {description}")
+        except Exception as e:
+            logging.error(f"Error creating alert: {e}")
+
+    def start_live_capture(self):
+        """Start live packet capture"""
+        self.running = True
+        logging.info(f"Starting live capture on interface {self.interface}")
+        
+        try:
+            scapy.sniff(
+                iface=self.interface,
+                prn=self.process_packet,
+                store=False,
+                filter="udp"
+            )
+        except KeyboardInterrupt:
+            logging.info("Capture stopped by user")
+        except Exception as e:
+            logging.error(f"Capture error: {e}")
+        finally:
+            self.running = False
+
+    def analyze_pcap(self):
+        """Analyze pcap file"""
+        logging.info(f"Analyzing pcap file: {self.pcap_file}")
+        try:
+            with open(self.pcap_file, 'rb') as f:
+                pcap = dpkt.pcap.Reader(f)
+                for timestamp, buf in pcap:
+                    # Convert to scapy packet for consistency
+                    packet = scapy.Ether(buf)
+                    self.process_packet(packet)
+        except Exception as e:
+            logging.error(f"Error analyzing pcap: {e}")
+
+    def get_stats(self) -> Dict:
+        """Get current statistics"""
+        return {
+            'active_calls': len(self.active_calls),
+            'total_calls_today': len(self.call_history),
+            'suspicious_calls': len(self.suspicious_calls),
+            'alerts_today': len([c for c in self.suspicious_calls if c['risk_score'] >= 50])
+        }
+
+def main():
+    parser = argparse.ArgumentParser(description="VoIP Call Tracer - Advanced SIP/RTP Analysis")
+    parser.add_argument('--interface', '-i', help='Network interface for live capture')
+    parser.add_argument('--pcap', '-p', help='PCAP file for analysis')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
+    
+    args = parser.parse_args()
+    
+    if not args.interface and not args.pcap:
+        parser.error("Either --interface or --pcap must be specified")
+    
+    tracer = VoIPTracer(args.interface, args.pcap)
+    
+    if args.pcap:
+        tracer.analyze_pcap()
+    else:
+        tracer.start_live_capture()
+
+if __name__ == "__main__":
+    main()
+
